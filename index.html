@@ -268,6 +268,9 @@
         </div>
     </div>
 
+    <!-- Toast -->
+    <div id="toast" class="hidden"></div>
+
     <!-- Bottom Navigation Bar -->
     <nav class="fixed bottom-0 left-0 right-0 bg-white/95 backdrop-blur-md border-t border-slate-200 z-50">
         <div class="max-w-md mx-auto grid grid-cols-3 h-16">
@@ -389,7 +392,7 @@
                 const chip = document.createElement('button');
                 chip.type = 'button';
                 chip.className = 'bg-indigo-50 hover:bg-indigo-100 text-indigo-700 text-[11px] font-bold px-2.5 py-1 rounded-xl border border-indigo-200/60 btn-active';
-                chip.innerHTML = `<i class="fa-solid fa-bolt mr-1 text-indigo-500"></i>${ex}`;
+                chip.innerHTML = `<i class="fa-solid fa-bolt mr-1 text-indigo-500"></i>${esc(ex)}`;
                 chip.onclick = () => {
                     exerciseSelect.value = ex;
                     onExerciseChange();
@@ -605,7 +608,47 @@
             document.getElementById('timer-display').textContent = `${m}:${s}`;
         }
 
-        // Save Record Logic
+        // ---- Backend: Vercel Functions (/api) + Google Sheets ----
+        // /api 가 설정되지 않았거나 실패하면 데모 모드(메모리 전용)로 동작합니다.
+        const LOGS_CACHE_KEY = 'fitter_logs_cache_v1';
+        let demoMode = false;
+
+        function esc(value) {
+            return String(value ?? '').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+        }
+
+        async function apiRequest(path, options = {}) {
+            const res = await fetch(path, { headers: { 'Content-Type': 'application/json' }, ...options });
+            if (!res.ok) throw new Error('API ' + res.status);
+            return res.json();
+        }
+
+        function cacheLogs() {
+            if (demoMode) return;
+            try { localStorage.setItem(LOGS_CACHE_KEY, JSON.stringify(allLogs)); } catch (e) {}
+        }
+
+        let toastTimer = null;
+        function showToast(message, isError = false) {
+            const el = document.getElementById('toast');
+            el.textContent = message;
+            el.className = 'fixed left-1/2 -translate-x-1/2 bottom-20 z-[60] px-4 py-2 rounded-2xl text-xs font-bold shadow-lg ' + (isError ? 'bg-rose-600 text-white' : 'bg-slate-900 text-white');
+            clearTimeout(toastTimer);
+            toastTimer = setTimeout(() => el.classList.add('hidden'), 2200);
+        }
+
+        // 드롭다운을 다시 만들되, 사용자가 고른 종목은 유지
+        function refreshDropdownKeepSelection() {
+            const select = document.getElementById('input-exercise');
+            const current = select.value;
+            updateExerciseDropdown();
+            if (current && [...select.options].some(o => o.value === current)) {
+                select.value = current;
+                onExerciseChange();
+            }
+        }
+
+        // Save Record Logic (저장 즉시 화면에 반영하고, 서버 저장은 백그라운드에서 처리)
         function saveRecord() {
             const date = document.getElementById('input-date').value;
             const exercise = document.getElementById('input-exercise').value;
@@ -639,46 +682,41 @@
                 return;
             }
 
-            const recordData = {
-                date: date,
-                routine: currentRoutine,
-                exercise: exercise,
-                sets: sets,
-                memo: memo
+            const recordData = { date: date, routine: currentRoutine, exercise: exercise, sets: sets, memo: memo };
+            const newLog = {
+                id: 'LOG_TMP_' + Date.now(),
+                ...recordData,
+                createdAt: new Date().toISOString().replace('T', ' ').substring(0, 19)
             };
 
-            showLoading(true);
+            allLogs.unshift(newLog);
+            switchTab('list');
 
-            if (typeof google !== 'undefined' && google.script && google.script.run) {
-                google.script.run
-                    .withSuccessHandler(res => {
-                        showLoading(false);
-                        alert('운동 일지가 성공적으로 저장되었습니다!');
-                        fetchLogs();
-                        switchTab('list');
-                    })
-                    .withFailureHandler(err => {
-                        showLoading(false);
-                        alert('저장 실패: ' + err.message);
-                    })
-                    .addLog(recordData);
-            } else {
-                setTimeout(() => {
-                    showLoading(false);
-                    const newLog = {
-                        id: 'LOG_LOCAL_' + Date.now(),
-                        date: date,
-                        routine: currentRoutine,
-                        exercise: exercise,
-                        sets: sets,
-                        memo: memo,
-                        createdAt: new Date().toISOString().replace('T', ' ').substring(0, 19)
-                    };
-                    allLogs.unshift(newLog);
-                    alert('운동 일지가 성공적으로 저장되었습니다!');
-                    switchTab('list');
-                }, 400);
+            if (demoMode) {
+                showToast('저장했어요 (데모 모드: 새로고침하면 사라져요)');
+                return;
             }
+
+            cacheLogs();
+            showToast('저장했어요');
+
+            apiRequest('/api/logs', { method: 'POST', body: JSON.stringify(recordData) })
+                .then(data => {
+                    if (newLog.deleted) {
+                        apiRequest('/api/logs?id=' + encodeURIComponent(data.log.id), { method: 'DELETE' }).catch(() => {});
+                        return;
+                    }
+                    newLog.id = data.log.id;
+                    newLog.createdAt = data.log.createdAt;
+                    cacheLogs();
+                    renderLogList();
+                })
+                .catch(() => {
+                    allLogs = allLogs.filter(l => l !== newLog);
+                    cacheLogs();
+                    renderLogList();
+                    showToast('저장 실패: 다시 시도해 주세요', true);
+                });
         }
 
         // Custom Exercise Management
@@ -692,78 +730,90 @@
             document.getElementById('add-exercise-modal').classList.add('hidden');
         }
 
+        function saveCustomLocal() {
+            try { localStorage.setItem('fitter_custom_exs', JSON.stringify(customExercises)); } catch (e) {}
+        }
+
         function saveCustomExercise() {
             const routine = document.getElementById('modal-routine-select').value;
             const exName = document.getElementById('modal-exercise-name').value.trim();
 
             if (!exName) return alert('종목명을 입력하세요.');
 
-            customExercises.push({ routine: routine, exercise: exName });
-            try {
-                localStorage.setItem('fitter_custom_exs', JSON.stringify(customExercises));
-            } catch(e) {}
+            if (!customExercises.some(c => c.routine === routine && c.exercise === exName)) {
+                customExercises.push({ routine: routine, exercise: exName });
+                saveCustomLocal();
+                if (!demoMode) {
+                    apiRequest('/api/exercises', { method: 'POST', body: JSON.stringify({ routine: routine, exercise: exName }) }).catch(() => {});
+                }
+            }
 
             closeAddExerciseModal();
             selectRoutine(routine);
             document.getElementById('input-exercise').value = exName;
             onExerciseChange();
-
-            if (typeof google !== 'undefined' && google.script && google.script.run) {
-                google.script.run.addCustomExercise(routine, exName);
-            }
         }
 
         function fetchCustomExercises() {
             try {
                 const local = localStorage.getItem('fitter_custom_exs');
                 if (local) customExercises = JSON.parse(local);
-            } catch(e) {}
+            } catch (e) {}
 
-            if (typeof google !== 'undefined' && google.script && google.script.run) {
-                google.script.run.withSuccessHandler(list => {
-                    if (list && list.length > 0) {
-                        customExercises = list;
-                        updateExerciseDropdown();
-                    }
-                }).getCustomExercises();
-            } else {
-                updateExerciseDropdown();
-            }
+            updateExerciseDropdown();
+
+            apiRequest('/api/exercises').then(data => {
+                const merged = [...customExercises];
+                (data.exercises || []).forEach(e => {
+                    if (!merged.some(m => m.routine === e.routine && m.exercise === e.exercise)) merged.push(e);
+                });
+                if (merged.length !== customExercises.length) {
+                    customExercises = merged;
+                    saveCustomLocal();
+                    refreshDropdownKeepSelection();
+                }
+            }).catch(() => {});
         }
 
-        // Fetch Logs & Render
+        // Fetch Logs & Render (캐시를 먼저 보여주고 서버 데이터로 갱신)
         function fetchLogs() {
-            showLoading(true);
-            if (typeof google !== 'undefined' && google.script && google.script.run) {
-                google.script.run
-                    .withSuccessHandler(data => {
-                        showLoading(false);
-                        allLogs = data;
-                        renderLogList();
-                    })
-                    .withFailureHandler(err => {
-                        showLoading(false);
-                        allLogs = SAMPLE_LOGS;
-                        renderLogList();
-                    })
-                    .getLogs();
-            } else {
-                setTimeout(() => {
-                    showLoading(false);
-                    allLogs = SAMPLE_LOGS;
+            try {
+                const cached = localStorage.getItem(LOGS_CACHE_KEY);
+                if (cached) {
+                    allLogs = JSON.parse(cached);
                     renderLogList();
-                }, 300);
-            }
+                    refreshDropdownKeepSelection();
+                }
+            } catch (e) {}
+
+            showLoading(true);
+            apiRequest('/api/logs')
+                .then(data => {
+                    demoMode = false;
+                    allLogs = data.logs;
+                    cacheLogs();
+                })
+                .catch(() => {
+                    if (allLogs.length === 0) {
+                        demoMode = true;
+                        allLogs = SAMPLE_LOGS.slice();
+                    }
+                })
+                .finally(() => {
+                    showLoading(false);
+                    renderLogList();
+                    refreshDropdownKeepSelection();
+                });
         }
 
         function renderLogList() {
             const container = document.getElementById('log-cards-container');
             const keyword = document.getElementById('search-keyword')?.value?.toLowerCase() || '';
 
-            const filtered = allLogs.filter(l => 
-                l.exercise.toLowerCase().includes(keyword) || 
-                l.routine.toLowerCase().includes(keyword) || 
-                l.date.includes(keyword)
+            const filtered = allLogs.filter(l =>
+                String(l.exercise).toLowerCase().includes(keyword) ||
+                String(l.routine).toLowerCase().includes(keyword) ||
+                String(l.date).includes(keyword)
             );
 
             document.getElementById('log-count-badge').textContent = `총 ${filtered.length}개`;
@@ -779,10 +829,10 @@
                 card.className = 'bg-white rounded-3xl p-4 shadow-sm border border-slate-200/80 space-y-2.5';
 
                 const setsText = log.sets.map((s, idx) => {
-                    let text = `${idx+1}세트: ${s.weight}kg × ${s.reps}회`;
+                    let text = `${idx+1}세트: ${Number(s.weight)}kg × ${Number(s.reps)}회`;
                     if (s.drops) {
                         s.drops.forEach(d => {
-                            text += ` <span class="text-amber-700 text-[10px]">(드롭 ${d.weight}kg×${d.reps}회)</span>`;
+                            text += ` <span class="text-amber-700 text-[10px]">(드롭 ${Number(d.weight)}kg×${Number(d.reps)}회)</span>`;
                         });
                     }
                     return `<span class="inline-block bg-slate-100 text-slate-700 text-[11px] font-bold px-2 py-0.5 rounded-lg border border-slate-200/60 mr-1 mb-1">${text}</span>`;
@@ -791,16 +841,16 @@
                 card.innerHTML = `
                     <div class="flex items-center justify-between pb-2 border-b border-slate-100">
                         <div class="flex items-center space-x-2">
-                            <span class="text-xs font-bold text-indigo-600 bg-indigo-50 px-2.5 py-1 rounded-xl">${log.routine}</span>
-                            <span class="font-bold text-sm text-slate-800">${log.exercise}</span>
+                            <span class="text-xs font-bold text-indigo-600 bg-indigo-50 px-2.5 py-1 rounded-xl">${esc(log.routine)}</span>
+                            <span class="font-bold text-sm text-slate-800">${esc(log.exercise)}</span>
                         </div>
                         <div class="flex items-center space-x-2">
-                            <span class="text-[11px] text-slate-400 font-medium">${log.date}</span>
-                            <button onclick="deleteRecord('${log.id}')" class="text-slate-300 hover:text-rose-500 p-1 btn-active"><i class="fa-solid fa-trash-can text-xs"></i></button>
+                            <span class="text-[11px] text-slate-400 font-medium">${esc(log.date)}</span>
+                            <button onclick="deleteRecord('${esc(log.id)}')" class="text-slate-300 hover:text-rose-500 p-1 btn-active"><i class="fa-solid fa-trash-can text-xs"></i></button>
                         </div>
                     </div>
                     <div class="flex flex-wrap pt-0.5">${setsText}</div>
-                    ${log.memo ? `<div class="text-[11px] text-slate-500 bg-slate-50 p-2 rounded-xl border border-slate-100"><i class="fa-solid fa-comment-dots mr-1.5 text-indigo-400"></i>${log.memo}</div>` : ''}
+                    ${log.memo ? `<div class="text-[11px] text-slate-500 bg-slate-50 p-2 rounded-xl border border-slate-100"><i class="fa-solid fa-comment-dots mr-1.5 text-indigo-400"></i>${esc(log.memo)}</div>` : ''}
                 `;
                 container.appendChild(card);
             });
@@ -812,22 +862,27 @@
 
         function deleteRecord(id) {
             if (!confirm('해당 운동 일지를 삭제하시겠습니까?')) return;
-            showLoading(true);
 
-            if (typeof google !== 'undefined' && google.script && google.script.run) {
-                google.script.run
-                    .withSuccessHandler(res => {
-                        showLoading(false);
-                        fetchLogs();
-                    })
-                    .deleteLog(id);
-            } else {
-                setTimeout(() => {
-                    showLoading(false);
-                    allLogs = allLogs.filter(l => l.id !== id);
-                    renderLogList();
-                }, 300);
+            const index = allLogs.findIndex(l => l.id === id);
+            if (index === -1) return;
+            const removed = allLogs.splice(index, 1)[0];
+            renderLogList();
+            cacheLogs();
+
+            if (demoMode) return;
+
+            // 아직 서버에 저장 중인 항목이면, 저장이 끝난 뒤 삭제되도록 표시만 남김
+            if (id.startsWith('LOG_TMP_')) {
+                removed.deleted = true;
+                return;
             }
+
+            apiRequest('/api/logs?id=' + encodeURIComponent(id), { method: 'DELETE' }).catch(() => {
+                allLogs.splice(index, 0, removed);
+                cacheLogs();
+                renderLogList();
+                showToast('삭제 실패: 다시 시도해 주세요', true);
+            });
         }
 
         // Summary Dashboard Renderer
@@ -890,8 +945,8 @@
                 card.innerHTML = `
                     <div class="flex items-center justify-between">
                         <div class="flex items-center space-x-2">
-                            <span class="text-xs font-bold text-slate-800">${ex}</span>
-                            <span class="text-[10px] font-medium text-slate-400">(${latest.routine})</span>
+                            <span class="text-xs font-bold text-slate-800">${esc(ex)}</span>
+                            <span class="text-[10px] font-medium text-slate-400">(${esc(latest.routine)})</span>
                         </div>
                         ${statusBadge}
                     </div>
